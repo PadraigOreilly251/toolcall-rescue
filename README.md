@@ -60,11 +60,13 @@ names are constants at the top; add another format, get the same net).
 Three branches:
 
 1. **Rescue (class 1, complete tail).** If the message ends with one or more
-   complete tool-call blocks (adjacent blocks = parallel calls), extract them
-   and **execute them as real tool calls in the same turn**, replacing the
-   leaked text with a note. `pi.executeToolCall()` handles execution; the
-   original call sites are lost (the server never reported a toolCallId) and
-   that is an accepted loss — the alternative is workflow death. Inner
+   complete tool-call blocks (adjacent blocks = parallel calls), the leaked
+   text is replaced by a note plus real toolCall blocks with freshly minted
+   ids and the stop reason is set to tool-use, so **pi's own agent loop
+   executes them in the same turn**, exactly as native calls. The server's
+   parser never materialized ids for the dropped calls, so there is no
+   server-side identity to preserve — an accepted loss; the alternative is
+   workflow death. Inner
    "borrowed closing tag" parameters are recovered best-effort from the last
    parsable parameter.
 2. **Sanitize (class 1, malformed tail).** If the tail carries the marker but
@@ -156,12 +158,18 @@ and the lost-call class.
   usually end in prose) but real.
 - **Blunts forensics.** Sanitize/lost-call handling mutates the stored
   message in place; the original leaked text is gone (a cut-note survives).
-  "What did the model actually emit?" questions are only answerable from the
-  stderr audit lines, not the transcript.
-- **Rescued calls lose their call sites.** `pi.executeToolCall()` makes fresh
-  toolCallIds; the server-side originals are gone. Anything that keys on the
-  original ids (some providers' streaming state, external tool-result
-  correlators) loses the link.
+  Mitigations since v0.2.0: every intervention also appends a persistent
+  session audit entry (metadata only — what, when, how much; never the
+  removed text, which is the poison), and `/rescue` shows the running
+  version. The raw payload itself is still unrecoverable; pair with your
+  engine's server-side parse-failure log if it has one (ninfer: warning
+  lines + `--request-log-jsonl` per-request parse diagnostics) to close the
+  forensic loop.
+- **Rescued calls have minted ids.** The reconstructed toolCall blocks get
+  fresh ids (the server never materialized ids for the dropped calls).
+  Anything that keys on server-side call ids (provider streaming state,
+  external tool-result correlators) cannot link them — in practice there is
+  no server-side record to link to at all.
 - **Blind to unknown formats.** Detection is exact-string (fragmented)
   matching of one markup family. A model that leaks a *different* engine's
   format gets no protection until a format block is added.
@@ -178,6 +186,44 @@ and the lost-call class.
   constraint, and two of its own build sessions died to it before the
   lost-call branch existed.)
 
+## Prior art
+
+Both failure classes are documented cross-framework Qwen-family problems,
+not one-off pi bugs (found 2026-09):
+
+- **QwenLM/qwen-code issue #10692** (2026-07): "tool_call-dialect XML tool
+  calls leak as plain text" — class 1, officially filed; qwen-code recovers
+  some dialects but misses the `<tool_call>` dialect its own system prompt
+  teaches (same self-priming dynamic as this extension's hygiene rule).
+- **llama.cpp issue #20837**: Qwen3.5 "prints tool calls in XML and stops"
+  — the class-1 symptom, engine-side.
+- **llama.cpp issue #21158**: Qwen3.5-27B tool-call parsing broken; reported
+  community workaround is denying structured tools entirely and routing
+  everything through one exec tool.
+- **froggeric/Qwen-Fixed-Chat-Templates PR #45** (merged into v21, 2026-07):
+  class-2 root cause on llama.cpp/ik_llama — the tool-call grammar triggers
+  on the envelope opener but the parser expects Hermes JSON inside, while
+  the v16+ template teaches XML inside; instruction-faithful models dump the
+  whole call into content with zero tool_calls and "the turn just ends".
+  Fix: teach the native Hermes JSON form in the template. (Custom engines
+  that parse the XML dialect deliberately — like the one this was built on —
+  are not covered by that fix.)
+- **Hugging Face Qwen3.6-27B discussion #13** (2026-09): "sometimes the
+  qwen3.6 model will respond with empty tool call which causing the agent
+  loop terminated" on vLLM — class 2, third framework.
+- **NVIDIA developer forums** (2026): Qwen3.5 tool calls leaking into the
+  reasoning block, model "would stop as if it were done".
+- **geo-agent issue #121**: client-side handling of text-format qwen3 tool
+  calls; documents truncation-induced leaks (matches the captured
+  "truncated tail" incident here).
+- **Pattern-level**: instructor / PydanticAI codify the standard
+  "retry on invalid structured output" — retry, don't salvage. Salvaging a
+  parseable call out of leaked text, plus a capped re-issue nudge for
+  unsalvageable ones, is the more aggressive half of this net.
+
+To the best of the author's search (2026-09-07), no pi extension doing this
+exists upstream; this is the first (client-side, both classes, same-turn).
+
 ## Limitations / honest split
 
 - **What it fixes:** silent workflow death *on the pi side* for the observed
@@ -190,6 +236,9 @@ and the lost-call class.
   mechanism-agnostic.
 
 ## Provenance
+
+v0.2.0 (2026-09-07): lost-call branch, persistent session audit entries
+(`appendEntry`), version stamp in `/rescue` status.
 
 Built in production incident response, September 2026, after multiple
 workflow deaths across several local serving engines (ninfer, llama.cpp,

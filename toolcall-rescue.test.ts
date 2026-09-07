@@ -1,24 +1,24 @@
 /**
- * toolcall-rescue.test.ts — unit tests for toolcall-rescue.ts
+ * toolcall-rescue.test.ts — tests for the installed extension
+ * (~/.pi/agent/extensions/toolcall-rescue.ts).
  *
- * Run: node toolcall-rescue.test.ts   (Node >= 22.6 with --experimental-strip-types, or Node 23+)
+ * Run: node toolcall-rescue.test.ts
  *
  * PARSER-HYGIENE (same rule as the extension itself): no contiguous
  * kill-marker string anywhere in this file. All tag constants are
  * assembled from fragments at runtime; the captured fixtures are built
  * by concatenation.
  *
- * PROVENANCE: the first write of this file was itself leaked as raw text
- * by the very bug under test (the engine parser broke on the payload).
- * Re-issued successfully minutes later — the failure is stochastic.
+ * PROVENANCE: originally written to /tmp on 2026-09-07 ~00:29 (first
+ * write leaked as raw text - the engine parser broke on the payload and
+ * the extension's sanitize path cut it). Re-issued successfully minutes
+ * later (failure is stochastic). /tmp was wiped by a host reboot at
+ * 05:37; this is the permanent copy (recreated from context, verified
+ * 22/22 green after recreation). 2026-09-07 13:30: case J added for the
+ * lost-call class (tool-use finish, zero calls delivered -> silent
+ * stop); the extension gained analyzeLostCall() for it.
  */
-import {
-  extractTailCalls,
-  recoverInnermost,
-  isEnabled,
-  analyzeLostCall,
-  hasMarkerEvidence,
-} from "./toolcall-rescue.ts";
+import { extractTailCalls, recoverInnermost, isEnabled, analyzeLostCall, hasMarkerEvidence } from "/home/erpod/.pi/agent/extensions/toolcall-rescue.ts";
 
 const T = ["tool", "_call"].join("");
 const OPEN = "<" + T + ">";

@@ -55,8 +55,18 @@
  *   TOOLCALL_RESCUE=on|off (also 1|0, true|false) env var overrides the state file.
  *   State: ~/.pi/agent/data/toolcall-rescue.json (default: on)
  *
- * Audit: every intervention -> stderr line "[toolcall-rescue] ...".
+ * Audit: every intervention -> stderr line "[toolcall-rescue] ..."
+ * PLUS a persistent session entry (pi.appendEntry, customType
+ * "toolcall-rescue"). The transcript itself is mutated in place by
+ * this extension, so the session file keeps an independent record of
+ * each intervention (what, when, how much). No removed text is stored
+ * (it is the poison); only metadata.
+ *
+ * Version stamp: /rescue status shows the running version, so a stale
+ * hot-reload or a pi-upgrade drift is visible (host-fragility watch item).
  */
+
+export const VERSION = "0.2.0";
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -305,6 +315,18 @@ function log(msg: string): void {
 
 export default function toolcallRescue(pi: ExtensionAPI) {
   const stats = { rescues: 0, nudges: 0, lostCalls: 0, capNotified: false };
+  const audit = (event: string, detail: Record<string, unknown>): void => {
+    try {
+      pi.appendEntry("toolcall-rescue", {
+        version: VERSION,
+        event,
+        ts: new Date().toISOString(),
+        ...detail,
+      });
+    } catch {
+      /* audit is best-effort; never crash the session */
+    }
+  };
 
   pi.on("message_end", async (event, ctx) => {
     const msg = event.message;
@@ -326,6 +348,7 @@ export default function toolcallRescue(pi: ExtensionAPI) {
           lost.markerEvidence +
           "); normalizing stopReason and nudging re-issue",
       );
+      audit("lost-call", { markerEvidence: lost.markerEvidence });
       if (stats.nudges < MAX_NUDGES) {
         stats.nudges++;
         try {
@@ -390,6 +413,7 @@ export default function toolcallRescue(pi: ExtensionAPI) {
       ];
       const names = toolCalls.map((t) => t.name).join(", ");
       log("rescued " + toolCalls.length + " tool call(s) from text: " + names);
+      audit("rescue", { names, count: toolCalls.length });
       try {
         ctx.ui?.notify?.("[toolcall-rescue] rescued: " + names, "info");
       } catch {
@@ -408,6 +432,7 @@ export default function toolcallRescue(pi: ExtensionAPI) {
         { type: "text" as const, text: note },
       ];
       log("malformed tail sanitized (" + (text.length - r.cutIndex) + " chars removed)");
+      audit("sanitize", { charsRemoved: text.length - r.cutIndex });
       if (stats.nudges < MAX_NUDGES) {
         stats.nudges++;
         try {
@@ -443,12 +468,12 @@ export default function toolcallRescue(pi: ExtensionAPI) {
         ctx.ui.notify(
           "toolcall-rescue: " + (isEnabled() ? "ON" : "OFF") +
             (env === "0" || env === "1" ? " (env override TOOLCALL_RESCUE=" + env + ")" : "") +
-            " | this process: " + stats.rescues + " rescued, " + stats.nudges + " nudged, " + stats.lostCalls + " lost-call(s) normalized",
+            " | this process: " + stats.rescues + " rescued, " + stats.nudges + " nudged, " + stats.lostCalls + " lost-call(s) normalized | v" + VERSION,
           "info",
         );
       }
     },
   });
 
-  log("loaded (enabled=" + isEnabled() + ")");
+  log("loaded v" + VERSION + " (enabled=" + isEnabled() + ")");
 }
