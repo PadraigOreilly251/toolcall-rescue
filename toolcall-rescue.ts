@@ -55,6 +55,15 @@
  *   TOOLCALL_RESCUE=on|off (also 1|0, true|false) env var overrides the state file.
  *   State: ~/.pi/agent/data/toolcall-rescue.json (default: on)
  *
+ * Trigger accounting (v0.3.0): every intervention (rescue / sanitize /
+ * lost-call) is counted persistently in
+ *   ~/.pi/agent/data/toolcall-rescue-counts.json
+ * (lifetime total, per-type, per provider/model pair, last event).
+ * Purely observational - shown in /rescue status, never feeds the
+ * decision path. Purpose: answer "how often does the net actually fire,
+ * and on which provider/model?" - the triage number for whether the
+ * underlying engine bug is worth chasing down.
+ *
  * Audit: every intervention -> stderr line "[toolcall-rescue] ..."
  * PLUS a persistent session entry (pi.appendEntry, customType
  * "toolcall-rescue"). The transcript itself is mutated in place by
@@ -66,7 +75,7 @@
  * hot-reload or a pi-upgrade drift is visible (host-fragility watch item).
  */
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -305,6 +314,95 @@ function setEnabled(v: boolean): void {
   }
 }
 
+// ── Trigger accounting (persistent, observational) ───────────────────
+const COUNTS_FILE = path.join(os.homedir(), ".pi", "agent", "data", "toolcall-rescue-counts.json");
+
+export type TriggerType = "rescue" | "sanitize" | "lostCall";
+
+export interface TriggerCounts {
+  total: number;
+  byType: { rescue: number; sanitize: number; lostCall: number };
+  byPair: Record<string, number>; // "provider/model" -> count
+  last: { type: TriggerType; provider: string; model: string; ts: string } | null;
+}
+
+export function emptyCounts(): TriggerCounts {
+  return { total: 0, byType: { rescue: 0, sanitize: 0, lostCall: 0 }, byPair: {}, last: null };
+}
+
+export function loadCounts(): TriggerCounts {
+  try {
+    const s = JSON.parse(fs.readFileSync(COUNTS_FILE, "utf8"));
+    if (s && typeof s.total === "number" && s.byType && typeof s.byType.rescue === "number") {
+      return {
+        total: s.total,
+        byType: {
+          rescue: s.byType.rescue,
+          sanitize: s.byType.sanitize ?? 0,
+          lostCall: s.byType.lostCall ?? 0,
+        },
+        byPair: s.byPair && typeof s.byPair === "object" ? s.byPair : {},
+        last: s.last && typeof s.last.type === "string" ? s.last : null,
+      };
+    }
+  } catch {
+    /* no counts file or corrupt JSON -> fresh */
+  }
+  return emptyCounts();
+}
+
+/** Pure: one intervention increments total, byType, byPair and sets last. */
+export function bumpCounts(
+  c: TriggerCounts,
+  type: TriggerType,
+  provider: string | undefined,
+  model: string | undefined,
+  ts: string,
+): TriggerCounts {
+  const prov = provider && provider.trim() ? provider : "unknown";
+  const mod = model && model.trim() ? model : "unknown";
+  const pair = prov + "/" + mod;
+  const byType = { ...c.byType };
+  byType[type] += 1;
+  return {
+    total: c.total + 1,
+    byType,
+    byPair: { ...c.byPair, [pair]: (c.byPair[pair] ?? 0) + 1 },
+    last: { type, provider: prov, model: mod, ts },
+  };
+}
+
+/** Pure: top-N "provider/model" pairs by count desc, then key asc. */
+export function topPairs(c: TriggerCounts, n = 3): Array<[string, number]> {
+  return Object.entries(c.byPair)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, n);
+}
+
+function saveCounts(c: TriggerCounts): void {
+  try {
+    fs.mkdirSync(path.dirname(COUNTS_FILE), { recursive: true });
+    fs.writeFileSync(COUNTS_FILE, JSON.stringify(c, null, 2));
+  } catch {
+    /* best-effort; never crash the session over bookkeeping */
+  }
+}
+
+function countsLine(c: TriggerCounts): string {
+  const parts = [
+    "lifetime: " + c.total +
+      " (R" + c.byType.rescue + " S" + c.byType.sanitize + " L" + c.byType.lostCall + ")",
+  ];
+  const top = topPairs(c, 3);
+  if (top.length > 0) {
+    parts.push("top: " + top.map(([k, v]) => k + "=" + v).join(", "));
+  }
+  if (c.last) {
+    parts.push("last: " + c.last.type + " @ " + c.last.provider + "/" + c.last.model + " " + c.last.ts);
+  }
+  return parts.join(" | ");
+}
+
 function log(msg: string): void {
   try {
     process.stderr.write("[toolcall-rescue] " + msg + "\n");
@@ -315,6 +413,7 @@ function log(msg: string): void {
 
 export default function toolcallRescue(pi: ExtensionAPI) {
   const stats = { rescues: 0, nudges: 0, lostCalls: 0, capNotified: false };
+  let counts = loadCounts();
   const audit = (event: string, detail: Record<string, unknown>): void => {
     try {
       pi.appendEntry("toolcall-rescue", {
@@ -333,6 +432,19 @@ export default function toolcallRescue(pi: ExtensionAPI) {
     if (msg.role !== "assistant") return;
     if (!isEnabled()) return;
 
+    // Count an intervention (persistent + provider/model attribution).
+    // Observational only - never feeds the decision path.
+    const note = (type: TriggerType): void => {
+      counts = bumpCounts(
+        counts,
+        type,
+        (msg as { provider?: string }).provider,
+        (msg as { model?: string }).model,
+        new Date().toISOString(),
+      );
+      saveCounts(counts);
+    };
+
     // ── Lost-call class: tool-use finish, zero calls delivered ────────
     const allText = msg.content
       .map((b) => {
@@ -343,12 +455,17 @@ export default function toolcallRescue(pi: ExtensionAPI) {
     const lost = analyzeLostCall(msg.stopReason, msg.content.map((b) => b.type), allText);
     if (lost.lostCall) {
       stats.lostCalls++;
+      note("lostCall");
       log(
         "lost tool call: finish signaled tool use but zero calls delivered (marker evidence: " +
           lost.markerEvidence +
           "); normalizing stopReason and nudging re-issue",
       );
-      audit("lost-call", { markerEvidence: lost.markerEvidence });
+      audit("lost-call", {
+        provider: (msg as { provider?: string }).provider,
+        model: (msg as { model?: string }).model,
+        markerEvidence: lost.markerEvidence,
+      });
       if (stats.nudges < MAX_NUDGES) {
         stats.nudges++;
         try {
@@ -396,6 +513,7 @@ export default function toolcallRescue(pi: ExtensionAPI) {
         return;
       }
       stats.rescues++;
+      note("rescue");
       const toolCalls = r.calls.map((c, i) => ({
         type: "toolCall" as const,
         id: "rescue-" + Date.now() + "-" + i,
@@ -413,7 +531,12 @@ export default function toolcallRescue(pi: ExtensionAPI) {
       ];
       const names = toolCalls.map((t) => t.name).join(", ");
       log("rescued " + toolCalls.length + " tool call(s) from text: " + names);
-      audit("rescue", { names, count: toolCalls.length });
+      audit("rescue", {
+        provider: (msg as { provider?: string }).provider,
+        model: (msg as { model?: string }).model,
+        names,
+        count: toolCalls.length,
+      });
       try {
         ctx.ui?.notify?.("[toolcall-rescue] rescued: " + names, "info");
       } catch {
@@ -423,6 +546,7 @@ export default function toolcallRescue(pi: ExtensionAPI) {
     }
 
     if (r.malformedTail && r.cutIndex !== null) {
+      note("sanitize");
       const prefix = text.slice(0, r.cutIndex).trim();
       const note = prefix
         ? prefix + "\n\n[toolcall-rescue: removed malformed tool-call text at end of previous reply]"
@@ -432,7 +556,11 @@ export default function toolcallRescue(pi: ExtensionAPI) {
         { type: "text" as const, text: note },
       ];
       log("malformed tail sanitized (" + (text.length - r.cutIndex) + " chars removed)");
-      audit("sanitize", { charsRemoved: text.length - r.cutIndex });
+      audit("sanitize", {
+        provider: (msg as { provider?: string }).provider,
+        model: (msg as { model?: string }).model,
+        charsRemoved: text.length - r.cutIndex,
+      });
       if (stats.nudges < MAX_NUDGES) {
         stats.nudges++;
         try {
@@ -468,7 +596,8 @@ export default function toolcallRescue(pi: ExtensionAPI) {
         ctx.ui.notify(
           "toolcall-rescue: " + (isEnabled() ? "ON" : "OFF") +
             (env === "0" || env === "1" ? " (env override TOOLCALL_RESCUE=" + env + ")" : "") +
-            " | this process: " + stats.rescues + " rescued, " + stats.nudges + " nudged, " + stats.lostCalls + " lost-call(s) normalized | v" + VERSION,
+            " | this process: " + stats.rescues + " rescued, " + stats.nudges + " nudged, " + stats.lostCalls + " lost-call(s) normalized"
+            + " | " + countsLine(counts) + " | v" + VERSION,
           "info",
         );
       }

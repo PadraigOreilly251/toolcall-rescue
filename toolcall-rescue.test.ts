@@ -18,7 +18,7 @@
  * lost-call class (tool-use finish, zero calls delivered -> silent
  * stop); the extension gained analyzeLostCall() for it.
  */
-import { extractTailCalls, recoverInnermost, isEnabled, analyzeLostCall, hasMarkerEvidence } from "/home/erpod/.pi/agent/extensions/toolcall-rescue.ts";
+import { extractTailCalls, recoverInnermost, isEnabled, analyzeLostCall, hasMarkerEvidence, emptyCounts, bumpCounts, topPairs } from "/home/erpod/.pi/agent/extensions/toolcall-rescue.ts";
 
 const T = ["tool", "_call"].join("");
 const OPEN = "<" + T + ">";
@@ -166,6 +166,24 @@ check(
 check("J: hasMarkerEvidence true on function tag", hasMarkerEvidence(FO + "bash>") === true);
 check("J: hasMarkerEvidence true on bare close marker", hasMarkerEvidence(CLOSE) === true);
 check("J: hasMarkerEvidence false on prose", hasMarkerEvidence("no tags here") === false);
+
+// K - trigger accounting (v0.3.0 pure functions)
+const K0 = emptyCounts();
+check("K: emptyCounts zeroed", K0.total === 0 && K0.byType.rescue === 0 && K0.byType.sanitize === 0 && K0.byType.lostCall === 0 && K0.last === null);
+const K1 = bumpCounts(K0, "sanitize", "ninfer", "qwen3.8-27b", "2026-09-07T14:00:00Z");
+check("K: bump total/byType", K1.total === 1 && K1.byType.sanitize === 1 && K1.byType.rescue === 0);
+check("K: bump byPair key", K1.byPair["ninfer/qwen3.8-27b"] === 1);
+check("K: bump last event", K1.last?.type === "sanitize" && K1.last?.provider === "ninfer" && K1.last?.model === "qwen3.8-27b");
+const K2 = bumpCounts(K1, "rescue", "ninfer", "qwen3.8-27b", "2026-09-07T14:01:00Z");
+const K3 = bumpCounts(K2, "lostCall", "vllm", "qwen3.6-27b", "2026-09-07T14:02:00Z");
+check("K: cumulative totals", K3.total === 3 && K3.byPair["ninfer/qwen3.8-27b"] === 2 && K3.byPair["vllm/qwen3.6-27b"] === 1);
+check("K: original untouched (pure)", K2.total === 2 && K2.byType.lostCall === 0);
+check("K: missing provider/model -> unknown", bumpCounts(K0, "rescue", undefined, "  ", "t").byPair["unknown/unknown"] === 1);
+const KT = topPairs(K3, 3);
+check("K: topPairs sorted desc + capped", KT.length === 2 && KT[0][0] === "ninfer/qwen3.8-27b" && KT[0][1] === 2 && KT[1][0] === "vllm/qwen3.6-27b");
+const Ktie = bumpCounts(bumpCounts(emptyCounts(), "rescue", "b", "x", "t"), "rescue", "a", "x", "t");
+check("K: topPairs tie -> key asc", topPairs(Ktie, 2)[0][0] === "a/x");
+check("K: topPairs cap", topPairs(K3, 1).length === 1);
 
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail === 0 ? 0 : 1);

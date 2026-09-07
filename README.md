@@ -143,8 +143,17 @@ and the lost-call class.
   hook only, no LLM calls, no network. Microseconds.
 - Engine-agnostic structure: per-format constants, easy to extend to other
   tool-calling markup styles.
-- Auditable and reversible: everything it does is stderr-logged; disable
-  with one env var or `/rescue off`; no state file to drift.
+- Auditable, reversible, and measured: everything it does is stderr-logged
+  and counted; disable with one env var or `/rescue off`; the only state
+  files are two small JSONs (toggle + trigger counts) in
+  `~/.pi/agent/data/`.
+- **Persistent trigger counter (v0.3.0).** Every intervention (rescue /
+  sanitize / lost-call) is counted lifetime, per type, and per
+  provider/model pair (`~/.pi/agent/data/toolcall-rescue-counts.json`).
+  `/rescue` status shows lifetime total, top provider/model pairs, and the
+  last event. Purely observational — it answers "how often does the net
+  actually fire, and on which provider/model?", the triage number for
+  whether the underlying engine bug is worth chasing down.
 - Executes the model's actual intent (rescue path) instead of just
   complaining — the work that was "lost" usually runs.
 - Unit-tested against captured field failures, not just synthetic ones.
@@ -236,6 +245,9 @@ exists upstream; this is the first (client-side, both classes, same-turn).
   mechanism-agnostic.
 
 ## Provenance
+
+v0.3.0 (2026-09-07): persistent trigger counter (lifetime + per
+provider/model), shown in `/rescue` status; provider/model in audit entries.
 
 v0.2.0 (2026-09-07): lost-call branch, persistent session audit entries
 (`appendEntry`), version stamp in `/rescue` status.
