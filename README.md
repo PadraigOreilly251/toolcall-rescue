@@ -246,6 +246,13 @@ exists upstream; this is the first (client-side, both classes, same-turn).
 
 ## Provenance
 
+v0.3.1 (2026-09-09): fix v0.3.0 regression - the sanitize branch's inner
+`const note` shadowed the new counter function `note` (temporal dead zone),
+so the first real malformed-tail leak under v0.3.0 crashed the handler
+before the cut ran (leak left in history, no nudge, no audit). Renamed the
+inner binding; added handler-level regression tests (pi mock, isolated
+HOME) covering all three branches plus the silent paths.
+
 v0.3.0 (2026-09-07): persistent trigger counter (lifetime + per
 provider/model), shown in `/rescue` status; provider/model in audit entries.
 

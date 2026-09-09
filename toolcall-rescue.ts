@@ -64,6 +64,14 @@
  * and on which provider/model?" - the triage number for whether the
  * underlying engine bug is worth chasing down.
  *
+ * v0.3.1 (2026-09-09): the sanitize branch crashed with a ReferenceError
+ * (temporal dead zone): its inner `const note` (the cut-note text) shadowed
+ * the v0.3.0 counter function `note` for the whole block, so the
+ * `note("sanitize")` call at the top of the branch threw before the cut
+ * ran. 2026-09-09 07:59Z in the wild: a leaked reply was correctly
+ * classified and then lost (no cut, no nudge, no audit). Fixed by renaming
+ * the inner binding to `cutNote`. Handler-level regression tests added.
+ *
  * Audit: every intervention -> stderr line "[toolcall-rescue] ..."
  * PLUS a persistent session entry (pi.appendEntry, customType
  * "toolcall-rescue"). The transcript itself is mutated in place by
@@ -75,7 +83,7 @@
  * hot-reload or a pi-upgrade drift is visible (host-fragility watch item).
  */
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.1";
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -548,12 +556,12 @@ export default function toolcallRescue(pi: ExtensionAPI) {
     if (r.malformedTail && r.cutIndex !== null) {
       note("sanitize");
       const prefix = text.slice(0, r.cutIndex).trim();
-      const note = prefix
+      const cutNote = prefix
         ? prefix + "\n\n[toolcall-rescue: removed malformed tool-call text at end of previous reply]"
         : "[toolcall-rescue: removed malformed tool-call text from previous reply]";
       const content = [
         ...msg.content.filter((b) => b.type !== "text"),
-        { type: "text" as const, text: note },
+        { type: "text" as const, text: cutNote },
       ];
       log("malformed tail sanitized (" + (text.length - r.cutIndex) + " chars removed)");
       audit("sanitize", {
