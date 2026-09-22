@@ -11,7 +11,7 @@ Coding agents that talk to local LLM servers (ninfer, llama.cpp, DS4, vLLM, …)
 depend on the server to parse tool calls out of raw token text. Some
 model/server pairings — most often Qwen-family models served from quantized
 weights — occasionally emit tool-call markup that the server's parser mishandles.
-Two death classes have been observed and instrumented in production sessions:
+Three death classes have been observed and instrumented in production sessions:
 
 ### Class 1 — leaked-to-text
 
@@ -40,6 +40,17 @@ claims a tool use that never happened; the loop has nothing to execute and
 ends the turn. In one session this happened **four times**; resuming cost 13
 seconds, 37 minutes, and 9 minutes of human patience respectively.
 
+### Class 3 — thinking-only dead turn
+
+The call never becomes visible text at all, and the stop reason does not
+even lie: the model writes the complete tool call into its own reasoning
+(thinking block) and stops with a plain "stop" and zero tool-call blocks.
+No visible leak to catch, no tool-use finish to flag — the turn ends with
+the intended call unexecuted. Observed 2026-09-22: a fully closed block was
+the model's last act, inside thinking. Distinct from class 2: class 2 lies
+via a tool-use finish with zero calls; class 3 is a clean stop with the
+call hidden in the reasoning.
+
 ### Why it's a trap to fix
 
 The pattern itself is toxic to the pipeline. Writing a detector for it
@@ -57,7 +68,7 @@ replacements reach the loop). It is **deterministic** — pure regex, no LLM
 calls, microseconds per message — and engine-agnostic in structure (the tag
 names are constants at the top; add another format, get the same net).
 
-Three branches:
+Three branches (plus two v0.3.2/v0.3.3 hardenings of the first two):
 
 1. **Rescue (class 1, complete tail).** If the message ends with one or more
    complete tool-call blocks (adjacent blocks = parallel calls), the leaked
@@ -69,11 +80,27 @@ Three branches:
    workflow death. Inner
    "borrowed closing tag" parameters are recovered best-effort from the last
    parsable parameter.
+   *v0.3.2:* a rescued block whose function name fails the engine's
+   tool-name constraint (`[A-Za-z0-9_-]{1,64}`) is **stripped instead of
+   materialized** — an engine-invalid name in history 400s every replay and
+   bricks the session (poison-in-history; the 2026-09-21 "job.sh" incident).
+   Valid siblings in the same run still materialize; counted as sanitize,
+   audited `reason: invalid-tool-name`.
+   *v0.3.3:* when a message has **no visible text and only thinking**
+   (class 3), this branch scans the reasoning text instead of the text
+   content; a fully closed tail block materializes exactly as above (name
+   guard included).
 2. **Sanitize (class 1, malformed tail).** If the tail carries the marker but
    no complete block survives, the region from the last opening envelope to
    the end of the text is **cut** (a short bracketed note is left so the
    transcript explains the gap) and a words-only follow-up nudge asks the
    model to re-issue the call as a real tool call.
+   *v0.3.3:* a max-tokens cut (stop reason "length") is admitted to this
+   scan — before, the guard bailed before the sanitizer and the truncated
+   tail persisted into history (2026-09-21: 47,002 chars of truncated
+   markup replayed into the session's context on every turn). A fully
+   closed tail block (the cut landed right after the close) materializes
+   instead. All other stop reasons remain untouched.
 3. **Lost-call (class 2).** If the message's stop reason says "tool use" but
    zero tool-call blocks were delivered, the call was dropped by the engine.
    The stored stop reason is normalized to a clean stop (a tool-use message
@@ -84,7 +111,14 @@ Guardrails:
 
 - **Tail-only rule.** A complete block followed by prose is an intentional
   quote (documentation) and is left alone. Only markup at the very end of the
-  message is treated as a degraded real call.
+  message is treated as a degraded real call. The rule also protects
+  thinking: a block the model drafted in reasoning and then continued past is
+  not its last act, and is left alone.
+- **Thinking is never mutated.** A malformed tail inside a thinking block
+  (v0.3.3) only nudges a re-issue — reasoning content may carry
+  provider-verified signatures; tampering risks 400 on replay. Materialization
+  of a closed thinking-tail block appends real toolCall blocks and leaves the
+  thinking block intact.
 - **Capped nudges.** Nudges share a per-process cap (default 3); after it,
   the net keeps sanitizing but says so once — it can't fix a persistently
   leaking model, only prevent silent death.
@@ -122,15 +156,31 @@ command (no restart needed). Verify it loaded: `/rescue`.
 
 ## Test
 
+Three suites (Node ≥ 22.6 with `--experimental-strip-types`, or Node 23+;
+plain `node` on Node 23+):
+
 ```sh
-node toolcall-rescue.test.ts
+node toolcall-rescue.test.ts                    # 40 pure-function unit tests
+node --experimental-strip-types \
+  toolcall-rescue.handler-test.ts               # 25 handler-level tests (pi mock, isolated HOME)
+node toolcall-rescue-tests/run.ts               # 43 v0.3.2/v0.3.3 regression checks
 ```
 
-(Node ≥ 22.6 with `--experimental-strip-types`, or Node 23+; plain `node` on
-Node 23+. Expect 30 passed, 0 failed.) The fixtures include the two captured
-field failures (complete-tail leak; borrowed-closing-tag tail), the
-intentional-quote guardrail, the truncated-tail guardrail, parallel blocks,
-and the lost-call class.
+The unit fixtures include the two captured field failures (complete-tail
+leak; borrowed-closing-tag tail), the intentional-quote guardrail, the
+truncated-tail guardrail, parallel blocks, and the lost-call class. The
+handler suite fires the real `message_end` handler through a pi mock and
+asserts each branch's observable effects (replacement content, nudge, audit
+entry, counter). The regression suite covers the v0.3.2 engine-invalid
+tool-name guard and the v0.3.3 thinking-only and length-cut classes,
+including both captured 2026-09 incident shapes (job.sh name poison;
+47,002-char truncated tail).
+
+Note: the two root-level suites import the **installed** extension
+(`~/.pi/agent/extensions/toolcall-rescue.ts`) by absolute path — copy this
+repo's `toolcall-rescue.ts` into an installed pi tree before running them
+there. `toolcall-rescue-tests/run.ts` imports its sibling
+`../toolcall-rescue.ts` and tests the copy in this repo.
 
 ## Pros and cons
 
@@ -154,6 +204,13 @@ and the lost-call class.
   last event. Purely observational — it answers "how often does the net
   actually fire, and on which provider/model?", the triage number for
   whether the underlying engine bug is worth chasing down.
+- **Engine-invalid name guard (v0.3.2).** A rescued call whose tool name
+  fails the engine's constraint is stripped, not materialized: a bad name in
+  history 400s every replay and bricks the session (2026-09-21 "job.sh"
+  incident).
+- **Wider net (v0.3.3).** The scan also sees calls the model wrote entirely
+  into its reasoning (thinking-only messages, class 3) and cuts junk left by
+  a max-tokens cut (stop reason "length") instead of storing it.
 - Executes the model's actual intent (rescue path) instead of just
   complaining — the work that was "lost" usually runs.
 - Unit-tested against captured field failures, not just synthetic ones.
@@ -245,6 +302,32 @@ exists upstream; this is the first (client-side, both classes, same-turn).
   mechanism-agnostic.
 
 ## Provenance
+
+v0.3.3 (2026-09-22): two blind spots closed after a session kept leaking.
+(C2) Thinking-only dead turn (class 3): when a message has no visible text
+and only thinking, the tail scan now runs over the reasoning text; a fully
+closed tail block materializes (name guard included), a malformed tail only
+nudges a re-issue (the thinking block is left intact — provider-verified
+signatures may exist). Anti-self-priming preserved: blocks the model
+drafted and then continued past are excluded; messages with visible text
+are still decided by the text path only. (C3) Max-tokens cut (stop reason
+"length") is now admitted to the scan: unclosed tails are sanitized +
+nudged (before, 47,002 chars of truncated markup persisted into session
+history and replayed on every turn), fully-closed tail blocks materialize.
+All other stop reasons untouched. Regression suite:
+toolcall-rescue-tests/run.ts (43 checks, both incident shapes included).
+
+v0.3.2 (2026-09-22): engine-invalid tool names. A rescued block whose
+function name fails the engine's tool-name constraint
+(`[A-Za-z0-9_-]{1,64}`) used to be materialized as-is; the engine then 400s
+every history replay ("function name must match ...") and the session
+bricks — poison-in-history. 2026-09-21 23:28Z in the wild: the model called
+the shell script "job.sh" as if it were a tool; the rescue materialized it
+and the recorded name 400'd the session on every subsequent replay. Now:
+names failing the constraint are stripped from the text (poison never
+reaches history) with a nudge to re-issue the action as a real tool call;
+sibling calls with valid names still materialize. Counted as sanitize;
+audited `reason: invalid-tool-name`.
 
 v0.3.1 (2026-09-09): fix v0.3.0 regression - the sanitize branch's inner
 `const note` shadowed the new counter function `note` (temporal dead zone),

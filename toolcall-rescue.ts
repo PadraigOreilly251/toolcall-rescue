@@ -72,6 +72,48 @@
  * classified and then lost (no cut, no nudge, no audit). Fixed by renaming
  * the inner binding to `cutNote`. Handler-level regression tests added.
  *
+ * v0.3.2 (2026-09-22): engine-invalid tool names. A rescued block whose
+ * function name fails the engine's tool-name constraint (OpenAI-compat
+ * servers validate tool_call names inside messages against
+ * [A-Za-z0-9_-]{1,64}) used to be materialized as-is: the engine then
+ * 400s every history replay ("function name must match ...", param
+ * "messages") and the session bricks - poison-in-history. 2026-09-21
+ * 23:28Z in the wild: the model called the shell script "job.sh" as if
+ * it were a tool (primed by job.sh hints); the rescue materialized it,
+ * core correctly answered "Tool job.sh not found", and the recorded
+ * tool_call name 400'd the session on ninfer forever. Now: names failing
+ * the constraint are stripped from the text (poison never reaches
+ * history) with a nudge to re-issue the action as a real tool call;
+ * sibling calls in the same run with valid names still materialize.
+ * Counted as sanitize; audited with reason "invalid-tool-name".
+ * Regression tests: toolcall-rescue-tests/run.ts (not auto-loaded -
+ * that directory has no index.ts).
+ *
+ * v0.3.3 (2026-09-22): two blind spots found while auditing a session
+ * that kept leaking (2026-09-22 05:24Z and 2026-09-21 22:16Z in the wild).
+ *   (C2) Thinking-only dead turn: a reasoning model (strix) emitted a
+ *       fully-closed tool-call block entirely inside its reasoning_content
+ *       (thinking) block and stopped with stopReason "stop", zero toolCall
+ *       blocks, and no visible text. The materialization scan is text-only
+ *       and the lost-call detector only fires on tool-use finishes, so the
+ *       turn died silently and the call never ran. Now: when a message has
+ *       NO text block and at least one thinking block, the tail scan runs
+ *       over the joined thinking text instead; a well-formed closed tail
+ *       block materializes exactly as in the text path (v0.3.2 name guard
+ *       included). A malformed tail inside thinking only nudges a re-issue -
+ *       the thinking block is left intact (provider-side thinking signatures
+ *       may verify it; tampering risks 400 on replay). Anti-self-priming
+ *       preserved: tail-anchoring excludes blocks the model drafted and then
+ *       continued past; messages with visible text are still decided by the
+ *       text path only. Audited with reason "thinking-only-malformed".
+ *   (C3) Max-tokens cut: stopReason "length" used to skip the whole scan,
+ *       so an unclosed markup tail left by a truncated reply persisted into
+ *       history (2026-09-21 22:16Z: 47,002 chars of truncated tool-call
+ *       markup in a session's context on every replay). Now "length" is
+ *       admitted to the scan: unclosed tails are sanitized + nudged like any
+ *       other; a fully-closed tail block (the cut landed right after the
+ *       close) materializes. All other stopReasons remain untouched.
+ *
  * Audit: every intervention -> stderr line "[toolcall-rescue] ..."
  * PLUS a persistent session entry (pi.appendEntry, customType
  * "toolcall-rescue"). The transcript itself is mutated in place by
@@ -83,7 +125,7 @@
  * hot-reload or a pi-upgrade drift is visible (host-fragility watch item).
  */
 
-export const VERSION = "0.3.1";
+export const VERSION = "0.3.3";
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -168,6 +210,27 @@ export interface RescueAnalysis {
   calls: RescuedCall[];
   malformedTail: boolean;
   cutIndex: number | null;
+}
+
+// Engine-side tool-name constraint: OpenAI-compat servers validate
+// tool_call names inside messages against this regex; a violation 400s
+// the whole session history on every replay (poison-in-history).
+export const VALID_TOOL_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * Split rescued calls into engine-legal and engine-invalid names.
+ * Pure - unit-testable without pi.
+ */
+export function partitionRescuedCalls(
+  calls: RescuedCall[],
+): { good: RescuedCall[]; bad: RescuedCall[] } {
+  const good: RescuedCall[] = [];
+  const bad: RescuedCall[] = [];
+  for (const c of calls) {
+    if (VALID_TOOL_NAME_RE.test(c.name)) good.push(c);
+    else bad.push(c);
+  }
+  return { good, bad };
 }
 
 /**
@@ -491,18 +554,111 @@ export default function toolcallRescue(pi: ExtensionAPI) {
       return { message: { ...msg, stopReason: "stop" as const } as typeof msg };
     }
 
-    if (msg.stopReason !== "stop") return;
+    // v0.3.3 (C3): a max-tokens cut (stopReason "length") can leave an
+    // unclosed markup tail in the text. "length" is now admitted to the
+    // scan: unclosed tails are sanitized + nudged; a fully-closed tail
+    // block (cut landed right after the close) materializes. All other
+    // stopReasons stay untouched.
+    if (msg.stopReason !== "stop" && msg.stopReason !== "length") return;
     if (msg.content.some((b) => b.type === "toolCall")) return;
 
-    const text = msg.content
-      .filter((b): b is { type: "text"; text: string } => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-    if (!text.includes(OPEN)) return;
+    const textBlocks = msg.content.filter(
+      (b): b is { type: "text"; text: string } => b.type === "text",
+    );
+    const text = textBlocks.map((b) => b.text).join("\n");
 
-    const r = extractTailCalls(text);
+    // v0.3.3 (C2): thinking-only dead turn. A reasoning model can emit
+    // the tool call entirely inside reasoning_content (thinking block)
+    // and stop with zero toolCall blocks and no visible text: the
+    // text-only scan never sees it, the lost-call detector only fires
+    // on tool-use finishes, and the turn dies silently.
+    //
+    // Scan thinking only when the message has NO text block at all:
+    // with visible text present, the text path owns the decision
+    // (anti-self-priming: a block followed by prose is a quote).
+    // Tail-anchoring in extractTailCalls excludes blocks the model
+    // drafted in thinking and then continued past.
+    const thinkingOnly =
+      textBlocks.length === 0 &&
+      msg.content.some((b) => b.type === "thinking");
+    const scanText = thinkingOnly
+      ? msg.content
+          .filter(
+            (b): b is { type: "thinking"; thinking: string } =>
+              b.type === "thinking",
+          )
+          .map((b) => b.thinking)
+          .join("\n")
+      : text;
+    if (!scanText.includes(OPEN)) return;
+
+    const r = extractTailCalls(scanText);
 
     if (r.calls.length > 0) {
+      // Engine-invalid name guard (v0.3.2): never materialize a tool call
+      // whose name the engine would reject - it would poison the session
+      // history (400 on every replay). Strip the bad block(s), keep valid
+      // siblings, nudge a real re-issue. Counted as sanitize.
+      const { good, bad } = partitionRescuedCalls(r.calls);
+      if (bad.length > 0) {
+        note("sanitize");
+        const badNames = bad.map((c) => c.name);
+        const remaining = stripSpans(
+          text,
+          r.calls.map((c) => [c.start, c.end] as [number, number]),
+        ).trim();
+        const cutNote =
+          (remaining ? remaining + "\n\n" : "") +
+          "[toolcall-rescue: removed tool-call block(s) with engine-invalid name(s) " +
+          badNames.join(", ") +
+          " - tool names may only contain letters, digits, underscores, and hyphens]";
+        const toolCalls = good.map((c, i) => ({
+          type: "toolCall" as const,
+          id: "rescue-" + Date.now() + "-" + i,
+          name: c.name,
+          arguments: c.arguments,
+        }));
+        const content = [
+          ...msg.content.filter((b) => b.type !== "text"),
+          { type: "text" as const, text: cutNote },
+          ...toolCalls,
+        ];
+        log(
+          "engine-invalid tool name(s) " + badNames.join(", ") +
+            " stripped from text (poison-in-history prevented)" +
+            (good.length ? "; " + good.length + " valid sibling(s) materialized" : ""),
+        );
+        audit("sanitize", {
+          provider: (msg as { provider?: string }).provider,
+          model: (msg as { model?: string }).model,
+          reason: "invalid-tool-name",
+          badNames,
+          materializedGood: good.length,
+        });
+        if (stats.nudges < MAX_NUDGES) {
+          stats.nudges++;
+          try {
+            await pi.sendUserMessage(
+              "Your previous reply ended with a tool call named \"" +
+                badNames.join('\", "') +
+                "\". That is not a valid tool name - tool names may only contain letters, digits, underscores, and hyphens. Re-issue the intended action as a real tool call (for shell commands, use the bash tool with the command string as an argument).",
+              { deliverAs: "followUp" },
+            );
+            log("invalid-name nudge delivered (" + stats.nudges + "/" + MAX_NUDGES + ")");
+          } catch (e) {
+            log("invalid-name nudge failed: " + e);
+          }
+        } else {
+          log("invalid-name nudge cap reached; stripped only");
+        }
+        return {
+          message: {
+            ...msg,
+            content,
+            stopReason: good.length > 0 ? ("toolUse" as const) : ("stop" as const),
+          } as typeof msg,
+        };
+      }
       if (stats.rescues >= MAX_RESCUES) {
         if (!stats.capNotified) {
           stats.capNotified = true;
@@ -554,6 +710,34 @@ export default function toolcallRescue(pi: ExtensionAPI) {
     }
 
     if (r.malformedTail && r.cutIndex !== null) {
+      if (thinkingOnly) {
+        // v0.3.3 (C2): the broken tail lives inside reasoning_content.
+        // Leave the thinking block intact (provider-side thinking
+        // signatures may verify it; tampering risks 400 on replay) and
+        // nudge a real re-issue. No message mutation.
+        note("sanitize");
+        log("malformed tool-call tail in thinking (thinking-only message); nudged, thinking left intact");
+        audit("sanitize", {
+          provider: (msg as { provider?: string }).provider,
+          model: (msg as { model?: string }).model,
+          reason: "thinking-only-malformed",
+        });
+        if (stats.nudges < MAX_NUDGES) {
+          stats.nudges++;
+          try {
+            await pi.sendUserMessage(
+              "Your previous reply ended with a tool call that was emitted as raw text instead of a structured tool call. It could not be recovered. Re-issue the intended tool call now, as a real tool call.",
+              { deliverAs: "followUp" },
+            );
+            log("nudge delivered (" + stats.nudges + "/" + MAX_NUDGES + ")");
+          } catch (e) {
+            log("nudge failed: " + e);
+          }
+        } else {
+          log("nudge cap reached; sanitized only");
+        }
+        return;
+      }
       note("sanitize");
       const prefix = text.slice(0, r.cutIndex).trim();
       const cutNote = prefix

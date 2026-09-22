@@ -203,7 +203,7 @@ function readCounts(): Record<string, unknown> | null {
   check("P: counter unchanged by silent paths", c4 !== null && (c4 as any).total === 3, c4);
 }
 
-check("P: VERSION stamp is 0.3.1", mod.VERSION === "0.3.1", mod.VERSION);
+check("P: VERSION stamp is 0.3.3", mod.VERSION === "0.3.3", mod.VERSION);
 
 console.log("\n" + pass + " passed, " + fail + " failed");
 console.log("(isolated HOME: " + HOME + ")");
