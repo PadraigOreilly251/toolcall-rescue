@@ -68,7 +68,8 @@ replacements reach the loop). It is **deterministic** — pure regex, no LLM
 calls, microseconds per message — and engine-agnostic in structure (the tag
 names are constants at the top; add another format, get the same net).
 
-Three branches (plus two v0.3.2/v0.3.3 hardenings of the first two):
+Three branches (plus the v0.3.2/v0.3.3 hardenings of the first two and
+the v0.3.4 second grammar):
 
 1. **Rescue (class 1, complete tail).** If the message ends with one or more
    complete tool-call blocks (adjacent blocks = parallel calls), the leaked
@@ -90,6 +91,14 @@ Three branches (plus two v0.3.2/v0.3.3 hardenings of the first two):
    (class 3), this branch scans the reasoning text instead of the text
    content; a fully closed tail block materializes exactly as above (name
    guard included).
+   *v0.3.4:* a **second leaked-markup grammar** is parsed. Models trained
+   on Claude transcripts emit Anthropic-style invoke/parameter tags rather
+   than the Qwen3-Coder-family envelope: a named invoke block containing
+   named parameter pairs, optionally inside a function_calls wrapper. The
+   grammar is chosen by the last marker actually present, so both the text
+   path and the thinking-only path accept it. Before this, the scan gate
+   required the Qwen opening envelope and returned before the parser ran
+   (2026-10-25 strix dead turn).
 2. **Sanitize (class 1, malformed tail).** If the tail carries the marker but
    no complete block survives, the region from the last opening envelope to
    the end of the text is **cut** (a short bracketed note is left so the
@@ -163,7 +172,7 @@ plain `node` on Node 23+):
 node toolcall-rescue.test.ts                    # 40 pure-function unit tests
 node --experimental-strip-types \
   toolcall-rescue.handler-test.ts               # 25 handler-level tests (pi mock, isolated HOME)
-node toolcall-rescue-tests/run.ts               # 43 v0.3.2/v0.3.3 regression checks
+node toolcall-rescue-tests/run.ts               # 56 v0.3.2-v0.3.4 regression checks
 ```
 
 The unit fixtures include the two captured field failures (complete-tail
@@ -172,9 +181,10 @@ truncated-tail guardrail, parallel blocks, and the lost-call class. The
 handler suite fires the real `message_end` handler through a pi mock and
 asserts each branch's observable effects (replacement content, nudge, audit
 entry, counter). The regression suite covers the v0.3.2 engine-invalid
-tool-name guard and the v0.3.3 thinking-only and length-cut classes,
-including both captured 2026-09 incident shapes (job.sh name poison;
-47,002-char truncated tail).
+tool-name guard, the v0.3.3 thinking-only and length-cut classes, and the
+v0.3.4 Anthropic-style dialect, including the captured 2026-09 incident
+shapes (job.sh name poison; 47,002-char truncated tail) and the 2026-10-25
+thinking-only invoke dead turn.
 
 Note: the two root-level suites import the **installed** extension
 (`~/.pi/agent/extensions/toolcall-rescue.ts`) by absolute path — copy this

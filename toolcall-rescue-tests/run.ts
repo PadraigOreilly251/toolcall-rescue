@@ -19,6 +19,7 @@ import toolcallRescue, {
   extractTailCalls,
   partitionRescuedCalls,
   VALID_TOOL_NAME_RE,
+  hasMarkerEvidence,
   type RescuedCall,
 } from "../toolcall-rescue.ts";
 
@@ -35,6 +36,18 @@ const PCLOSE = "</" + "parameter>";
 function block(name: string, params: Array<[string, string]>): string {
   const ps = params.map(([k, v]) => POPEN + k + ">" + v + PCLOSE).join("");
   return OPEN + FOPEN + name + ">" + ps + FCLOSE + CLOSE;
+}
+
+// v0.3.4: Anthropic-style dialect, assembled from fragments (parser hygiene).
+const IOPEN = "<" + "invoke" + ' name="';
+const ICLOSE = "</" + "invoke>";
+const PNAME_OPEN = "<" + "parameter" + ' name="';
+const FCALLS_OPEN = "<" + "function_calls>";
+const FCALLS_CLOSE = "</" + "function_calls>";
+
+function invokeBlock(name: string, params: Array<[string, string]>): string {
+  const ps = params.map(([k, v]) => PNAME_OPEN + k + '">' + v + PCLOSE).join("\n");
+  return IOPEN + name + '">\n' + ps + "\n" + ICLOSE;
 }
 
 let failed = 0;
@@ -78,6 +91,43 @@ check(
     partMixed.good.length === 1 &&
     partMixed.bad[0].name === "job.sh" &&
     partMixed.good[0].name === "bash",
+);
+
+// ── v0.3.4: Anthropic-style <invoke> dialect ─────────────────────────
+const inv = extractTailCalls("prose\n" + invokeBlock("bash", [["command", "echo hi"]]));
+check("invoke: closed block parsed", inv.calls.length === 1 && inv.calls[0].name === "bash");
+check("invoke: command argument", inv.calls[0]?.arguments?.command === "echo hi");
+check("invoke: no malformedTail", inv.malformedTail === false);
+
+const invWrapped = extractTailCalls(
+  FCALLS_OPEN + "\n" + invokeBlock("bash", [["command", "ls"]]) + "\n" + FCALLS_CLOSE,
+);
+check(
+  "invoke: <function_calls> wrapper parsed",
+  invWrapped.calls.length === 1 && invWrapped.calls[0].name === "bash",
+);
+
+const invParallel = extractTailCalls(
+  invokeBlock("read", [["path", "/tmp/x"]]) + "\n" + invokeBlock("bash", [["command", "ls"]]),
+);
+check(
+  "invoke: parallel blocks -> 2 calls",
+  invParallel.calls.length === 2 && invParallel.calls[1].name === "bash",
+);
+
+const invProse = extractTailCalls(
+  invokeBlock("bash", [["command", "ls"]]) + "\nthat's the plan, but not yet",
+);
+check(
+  "invoke: prose after block left alone",
+  invProse.calls.length === 0 && invProse.malformedTail === false,
+);
+
+const invCut = extractTailCalls("prose\n" + IOPEN + 'bash">\n' + PNAME_OPEN + 'command">echo');
+check("invoke: truncated tail malformed", invCut.calls.length === 0 && invCut.malformedTail === true);
+check(
+  "invoke: marker evidence",
+  hasMarkerEvidence(IOPEN + 'bash">' + PNAME_OPEN + 'command">x' + PCLOSE),
 );
 
 // ── handler-level (stubbed pi; counts file backed up + restored) ─────
@@ -354,6 +404,43 @@ function msgWithText(text: string) {
       "C3: length-cut closed block materialized",
       calls9.length === 1 && calls9[0].name === "bash" && m9.stopReason === "toolUse",
     );
+    // Case 10 (v0.3.4 C4): the 2026-10-25 19:39Z strix incident - an
+    // Anthropic <invoke> block emitted INSIDE thinking, no text block,
+    // stop=stop, zero toolCalls. Pre-v0.3.4 the gate required a Qwen
+    // marker, so the turn died silently with the call never executed.
+    const f10 = makeFake();
+    const r10 = await f10.handler(
+      {
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "thinking",
+              thinking:
+                "I've got the numbers I need. Let me check the models.yaml entry.\n\n" +
+                invokeBlock("bash", [["command", "echo real-payload"]]),
+            },
+          ],
+          stopReason: "stop",
+          provider: "strix",
+          model: "strix",
+        },
+      },
+      { ui: undefined },
+    );
+    const m10 = r10!.message;
+    const calls10 = m10.content.filter((b) => b.type === "toolCall");
+    check(
+      "C4 strix: invoke-in-thinking materialized",
+      calls10.length === 1 && calls10[0].name === "bash",
+    );
+    check("C4 strix: stopReason toolUse", m10.stopReason === "toolUse");
+    check(
+      "C4 strix: thinking preserved intact",
+      m10.content.some((b) => b.type === "thinking"),
+    );
+    check("C4 strix: no nudge on clean materialization", f10.sent.length === 0);
+    check("C4 strix: audit rescue entry", f10.entries.some((e) => e.event === "rescue"));
   } finally {
     if (countsBackup !== null) fs.writeFileSync(COUNTS_FILE, countsBackup);
   }

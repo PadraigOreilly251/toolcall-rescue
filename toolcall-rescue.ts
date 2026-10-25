@@ -125,7 +125,7 @@
  * hot-reload or a pi-upgrade drift is visible (host-fragility watch item).
  */
 
-export const VERSION = "0.3.3";
+export const VERSION = "0.3.4";
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -160,6 +160,30 @@ const PARAM_RE = new RegExp(
 );
 
 const PARAM_OPEN_ANY_RE = new RegExp(esc(PARAM_OPEN) + "([^>]*)>", "g");
+
+// ── Anthropic-style dialect (v0.3.4) ───────────────────────────────────
+// Models trained on Claude transcripts leak a different grammar than the
+// Qwen one above: a named invoke block holding named parameter pairs,
+// optionally wrapped in a function_calls envelope. Tag strings live in the
+// INVOKE_* / PARAM_NAME_* constants below (assembled from fragments, as
+// everywhere in this file). Observed in the wild from strix (thinking-only
+// dead turn) and deepseek150vision (harmless: a real toolCall accompanied
+// it).
+const INVOKE_OPEN = "<" + "invoke";
+const INVOKE_CLOSE = "</" + "invoke>";
+const PARAM_NAME_OPEN = "<" + "parameter" + " name=\"";
+const FUNCTION_CALLS_CLOSE = "</" + "function_calls>";
+
+const INVOKE_BLOCK_RE = new RegExp(
+  esc(INVOKE_OPEN) + "\\s+name=\"([^\"]+)\"\\s*>\\s*" +
+    "((?:" + esc(PARAM_NAME_OPEN) + "[^\"]*\"\\s*>[\\s\\S]*?\\s*" + esc(PARAM_CLOSE) + ")*)" +
+    "\\s*" + esc(INVOKE_CLOSE),
+  "g",
+);
+const INVOKE_PARAM_RE = new RegExp(
+  esc(PARAM_NAME_OPEN) + "([^\"]*)\"\\s*>\\s*([\\s\\S]*?)\\s*" + esc(PARAM_CLOSE),
+  "g",
+);
 
 /**
  * Malformed-nesting salvage: the model opened an inner parameter inside
@@ -233,21 +257,54 @@ export function partitionRescuedCalls(
   return { good, bad };
 }
 
-/**
- * Analyze assistant text for leaked tool markup at the END of the
- * message. Pure function - unit-testable without pi.
- */
-export function extractTailCalls(text: string): RescueAnalysis {
-  const lastOpenIdx = text.lastIndexOf(OPEN);
+/** One leaked-markup grammar a model can emit. */
+interface MarkupDialect {
+  /** Marker whose LAST occurrence bounds the tail. */
+  anchor: string;
+  /** Complete block: group 1 = tool name, group 2 = parameter run. */
+  blockRe: RegExp;
+  /** One parameter: group 1 = key, group 2 = raw value. */
+  paramRe: RegExp;
+  /** Optional wrapper close allowed after the block run. */
+  suffix?: string;
+}
+
+const QWEN_DIALECT: MarkupDialect = {
+  anchor: OPEN,
+  blockRe: BLOCK_RE,
+  paramRe: PARAM_RE,
+};
+
+const ANTHROPIC_DIALECT: MarkupDialect = {
+  anchor: INVOKE_OPEN,
+  blockRe: INVOKE_BLOCK_RE,
+  paramRe: INVOKE_PARAM_RE,
+  suffix: FUNCTION_CALLS_CLOSE,
+};
+
+/** End offset of the meaningful tail (whitespace and optional wrapper close). */
+function trimTail(text: string, suffix?: string): number {
+  let end = text.length;
+  while (end > 0 && /\s/.test(text[end - 1])) end--;
+  if (suffix && text.slice(0, end).endsWith(suffix)) {
+    end -= suffix.length;
+    while (end > 0 && /\s/.test(text[end - 1])) end--;
+  }
+  return end;
+}
+
+function analyzeDialect(text: string, d: MarkupDialect): RescueAnalysis {
+  const lastOpenIdx = text.lastIndexOf(d.anchor);
   if (lastOpenIdx === -1) return { calls: [], malformedTail: false, cutIndex: null };
 
-  const matches = [...text.matchAll(BLOCK_RE)];
+  const matches = [...text.matchAll(d.blockRe)];
   const last = matches[matches.length - 1];
+  const tailEnd = trimTail(text, d.suffix);
 
   // A complete block starts exactly at the last marker.
   if (last && last.index === lastOpenIdx) {
     // Prose after the block -> intentional quote/explanation. Leave alone.
-    if (text.slice(last.index + last[0].length).trim() !== "") {
+    if (text.slice(last.index + last[0].length, tailEnd).trim() !== "") {
       return { calls: [], malformedTail: false, cutIndex: null };
     }
     // Extend left over adjacent blocks (parallel calls).
@@ -262,8 +319,8 @@ export function extractTailCalls(text: string): RescueAnalysis {
     for (const m of run) {
       const args: Record<string, unknown> = {};
       let n = 0;
-      for (const pm of m[2].matchAll(PARAM_RE)) {
-        let value = parseValue(pm[2]);
+      for (const pm of m[2].matchAll(d.paramRe)) {
+        const value = parseValue(pm[2]);
         if (typeof value === "string" && value.includes(PARAM_OPEN)) {
           // Unclosed inner parameter (case-B shape): recover the inner
           // parameter's key/value instead of keeping the garbage outer one.
@@ -292,13 +349,29 @@ export function extractTailCalls(text: string): RescueAnalysis {
   const region = text.slice(lastOpenIdx);
   const markupish =
     region.trim() === "" ||
+    region.includes("<" + "parameter") ||
     region.includes(FUNC_OPEN) || region.includes(PARAM_OPEN) ||
-    region.includes(CLOSE) || region.includes(FUNC_CLOSE);
+    region.includes(CLOSE) || region.includes(FUNC_CLOSE) ||
+    (d.suffix ? region.includes(d.suffix) : false);
   if (markupish) {
     return { calls: [], malformedTail: true, cutIndex: lastOpenIdx };
   }
   // Prose after the marker -> marker quoted mid-sentence. Leave alone.
   return { calls: [], malformedTail: false, cutIndex: null };
+}
+
+/**
+ * Analyze assistant text for leaked tool markup at the END of the
+ * message. Pure function - unit-testable without pi.
+ *
+ * Tries the Qwen grammar first (preserves historical behavior), then the
+ * Anthropic one. A malformed verdict from the first wins only when it is
+ * the grammar actually present.
+ */
+export function extractTailCalls(text: string): RescueAnalysis {
+  const qwen = analyzeDialect(text, QWEN_DIALECT);
+  if (qwen.calls.length > 0 || qwen.malformedTail) return qwen;
+  return analyzeDialect(text, ANTHROPIC_DIALECT);
 }
 
 function stripSpans(text: string, spans: Array<[number, number]>): string {
@@ -347,7 +420,10 @@ export function hasMarkerEvidence(text: string): boolean {
     text.includes(FUNC_OPEN) ||
     text.includes(FUNC_CLOSE) ||
     text.includes(PARAM_OPEN) ||
-    text.includes(PARAM_CLOSE)
+    text.includes(PARAM_CLOSE) ||
+    text.includes(INVOKE_OPEN) ||
+    text.includes(INVOKE_CLOSE) ||
+    text.includes(PARAM_NAME_OPEN)
   );
 }
 
@@ -590,7 +666,7 @@ export default function toolcallRescue(pi: ExtensionAPI) {
           .map((b) => b.thinking)
           .join("\n")
       : text;
-    if (!scanText.includes(OPEN)) return;
+    if (!hasMarkerEvidence(scanText)) return;
 
     const r = extractTailCalls(scanText);
 

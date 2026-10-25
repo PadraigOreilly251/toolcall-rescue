@@ -10,6 +10,34 @@ Hygiene note (as with every file in this repo): no contiguous instance of
 the detection marker appears below; "tool-call markup", "opening envelope",
 and "close" refer to the Qwen3-Coder-family XML tags.
 
+## [0.3.4] — 2026-10-25
+
+One blind spot closed: a **second leaked-markup grammar**. Models trained on
+Claude transcripts emit Anthropic-style invoke/parameter tags instead of the
+Qwen3-Coder-family envelope the net was built around.
+
+### Added
+
+- **Anthropic-style dialect (class 1 / class 3).** The tail scan now parses a
+  named invoke block containing one or more named parameter pairs, optionally
+  wrapped in a function_calls envelope. Both the text path and the v0.3.3
+  thinking-only path use it; the grammar is chosen by the last marker actually
+  present.
+  - The pre-0.3.4 gate required the Qwen opening envelope, so a message whose
+    only markup was the Anthropic form returned before the parser ran. The
+    gate now uses the same marker-evidence predicate as the lost-call branch.
+  - `hasMarkerEvidence` recognizes the invoke/parameter tags, so lost-call
+    reporting has evidence for this grammar too.
+  - Incident: 2026-10-25 19:39Z (strix) — a complete invoke block was the
+    model's last act, inside thinking, stopReason "stop", zero toolCall
+    blocks. The turn died silently and the intended command never ran.
+    Frequency check across the local session store: 10 occurrences in 2
+    session files; 9 were harmless (a real toolCall accompanied the
+    narration), 1 was this dead turn.
+- **Regression tests.** 13 new checks (56 total): bare block, function_calls
+  wrapper, parallel blocks, prose-after-block guardrail, truncated tail,
+  marker evidence, and a handler-level reproduction of the strix dead turn.
+
 ## [0.3.3] — 2026-09-22
 
 Two blind spots closed after a session kept leaking. Both classes were found
