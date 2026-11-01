@@ -114,6 +114,21 @@
  *       other; a fully-closed tail block (the cut landed right after the
  *       close) materializes. All other stopReasons remain untouched.
  *
+ * v0.3.5 (2026-11-01): (C5) thinking-only dead turn with NO marker
+ *       evidence. A reasoning model can stop inside its thinking without
+ *       writing any tool-call marker: the provider ends the turn on its
+ *       own control token (in the wild, Qwen quoting a literal end-of-turn
+ *       control token in its reasoning - the tokenizer turns the quote
+ *       into the real end token and the engine stops). C2 needs marker
+ *       evidence and the lost-call path needs stopReason "toolUse", so
+ *       the turn died silently. Now: a thinking-only, stop-finished
+ *       message with no text, no toolCall and no marker gets a
+ *       "continue" nudge; a second dead turn gets the firm "do not end
+ *       the turn inside thinking" nudge; after two, the extension stops
+ *       nudging and notifies the user (server-side fault, not a client
+ *       bug). Counted as emptyTurn; audited with reason
+ *       "thinking-only-empty". stopReason "length"/"aborted" untouched.
+ *
  * Audit: every intervention -> stderr line "[toolcall-rescue] ..."
  * PLUS a persistent session entry (pi.appendEntry, customType
  * "toolcall-rescue"). The transcript itself is mutated in place by
@@ -125,7 +140,7 @@
  * hot-reload or a pi-upgrade drift is visible (host-fragility watch item).
  */
 
-export const VERSION = "0.3.4";
+export const VERSION = "0.3.5";
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -464,17 +479,17 @@ function setEnabled(v: boolean): void {
 // ── Trigger accounting (persistent, observational) ───────────────────
 const COUNTS_FILE = path.join(os.homedir(), ".pi", "agent", "data", "toolcall-rescue-counts.json");
 
-export type TriggerType = "rescue" | "sanitize" | "lostCall";
+export type TriggerType = "rescue" | "sanitize" | "lostCall" | "emptyTurn";
 
 export interface TriggerCounts {
   total: number;
-  byType: { rescue: number; sanitize: number; lostCall: number };
+  byType: { rescue: number; sanitize: number; lostCall: number; emptyTurn: number };
   byPair: Record<string, number>; // "provider/model" -> count
   last: { type: TriggerType; provider: string; model: string; ts: string } | null;
 }
 
 export function emptyCounts(): TriggerCounts {
-  return { total: 0, byType: { rescue: 0, sanitize: 0, lostCall: 0 }, byPair: {}, last: null };
+  return { total: 0, byType: { rescue: 0, sanitize: 0, lostCall: 0, emptyTurn: 0 }, byPair: {}, last: null };
 }
 
 export function loadCounts(): TriggerCounts {
@@ -487,6 +502,7 @@ export function loadCounts(): TriggerCounts {
           rescue: s.byType.rescue,
           sanitize: s.byType.sanitize ?? 0,
           lostCall: s.byType.lostCall ?? 0,
+          emptyTurn: s.byType.emptyTurn ?? 0,
         },
         byPair: s.byPair && typeof s.byPair === "object" ? s.byPair : {},
         last: s.last && typeof s.last.type === "string" ? s.last : null,
@@ -538,7 +554,8 @@ function saveCounts(c: TriggerCounts): void {
 function countsLine(c: TriggerCounts): string {
   const parts = [
     "lifetime: " + c.total +
-      " (R" + c.byType.rescue + " S" + c.byType.sanitize + " L" + c.byType.lostCall + ")",
+      " (R" + c.byType.rescue + " S" + c.byType.sanitize + " L" + c.byType.lostCall +
+      " E" + c.byType.emptyTurn + ")",
   ];
   const top = topPairs(c, 3);
   if (top.length > 0) {
@@ -559,7 +576,15 @@ function log(msg: string): void {
 }
 
 export default function toolcallRescue(pi: ExtensionAPI) {
-  const stats = { rescues: 0, nudges: 0, lostCalls: 0, capNotified: false };
+  const stats = {
+    rescues: 0,
+    nudges: 0,
+    lostCalls: 0,
+    capNotified: false,
+    emptyTurns: 0,
+    emptyNudges: 0,
+    emptyCapNotified: false,
+  };
   let counts = loadCounts();
   const audit = (event: string, detail: Record<string, unknown>): void => {
     try {
@@ -666,7 +691,60 @@ export default function toolcallRescue(pi: ExtensionAPI) {
           .map((b) => b.thinking)
           .join("\n")
       : text;
-    if (!hasMarkerEvidence(scanText)) return;
+    if (!hasMarkerEvidence(scanText)) {
+      // v0.3.5 (C5): thinking-only dead turn with NO marker evidence.
+      // A reasoning model can stop inside its thinking without ever
+      // writing a tool-call marker: the provider ends the turn on its
+      // own control token (observed when the model quotes a literal
+      // end-of-turn control token: the tokenizer turns the quote into
+      // the real end token and the engine stops). C2 needs marker
+      // evidence and the lost-call path needs stopReason "toolUse", so
+      // this turn dies silently. Nudge a continue; escalate once; then
+      // stop nudging and tell the user, so a server-side fault stays
+      // visible instead of looping.
+      if (!thinkingOnly || msg.stopReason !== "stop") return;
+      note("emptyTurn");
+      stats.emptyTurns++;
+      audit("thinking-only-empty", {
+        provider: (msg as { provider?: string }).provider,
+        model: (msg as { model?: string }).model,
+        nudge: Math.min(stats.emptyNudges + 1, 2),
+        capped: stats.emptyNudges >= 2,
+      });
+      if (stats.emptyNudges < 2) {
+        stats.emptyNudges++;
+        const nudge =
+          stats.emptyNudges === 1
+            ? "Your previous reply ended inside its thinking with no answer. Continue from where you stopped: close the thinking and answer the user, or call the tool you intended."
+            : "Your previous reply ended inside its thinking again. Do not end the turn inside thinking. Close the thinking now and either answer the user or call a tool.";
+        try {
+          await pi.sendUserMessage(nudge, { deliverAs: "followUp" });
+          log(
+            "thinking-only dead turn (no marker evidence); nudge delivered (" +
+              stats.emptyNudges +
+              "/2)",
+          );
+        } catch (e) {
+          log("thinking-only nudge failed: " + e);
+        }
+      } else {
+        log("thinking-only dead-turn nudge cap reached (2); notifying user");
+        if (!stats.emptyCapNotified) {
+          stats.emptyCapNotified = true;
+          try {
+            ctx.ui?.notify?.(
+              "[toolcall-rescue] this model has ended " +
+                stats.emptyTurns +
+                " turns inside its thinking with no answer; nudges are capped. The provider/engine is ending turns on a control token - check its thinking-close handling (e.g. Strata reasoning_close_retry).",
+              "warning",
+            );
+          } catch {
+            /* non-UI mode */
+          }
+        }
+      }
+      return;
+    }
 
     const r = extractTailCalls(scanText);
 

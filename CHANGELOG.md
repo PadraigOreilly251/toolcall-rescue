@@ -10,6 +10,53 @@ Hygiene note (as with every file in this repo): no contiguous instance of
 the detection marker appears below; "tool-call markup", "opening envelope",
 and "close" refer to the Qwen3-Coder-family XML tags.
 
+## [0.3.5] — 2026-11-01
+
+A third death class, one notch removed from leaked markup: the model never emits
+markup at all. The turn ends **inside its own reasoning** and the harness sees a
+clean stop with no content.
+
+### Added
+
+- **(C5) Thinking-only dead turn with no marker evidence.** A reasoning model can
+  stop inside its thinking without ever writing a tool-call marker. Observed in the
+  wild when the model *quotes* a literal end-of-turn control token in its
+  reasoning: the tokenizer turns the quote into the real end token and the engine
+  stops on it, so not one character of the marker reaches the text. The result is a
+  thinking-only message with `stopReason: "stop"` and zero visible text.
+  - Why the existing branches missed it: the v0.3.3 thinking-only path requires
+    marker evidence, and the lost-call path requires `stopReason: "toolUse"`. This
+    turn satisfies neither, so it died silently.
+  - Now: first dead turn gets a `continue` nudge; the second gets the firm
+    *do not end the turn inside thinking* nudge; after two the extension stops
+    nudging and notifies the user with the provider layer to fix (this is a
+    server/engine fault, not a client bug) — so a persistent engine fault stays
+    visible instead of looping.
+  - `stopReason: "length"` and `"aborted"` remain untouched.
+- **New trigger type `emptyTurn`** — counted in the persistent counter and shown as
+  `E<n>` in `/rescue` status; audited as `thinking-only-empty` with `nudge` and
+  `capped` fields.
+- **Counter-schema forward compatibility.** `loadCounts()` defaults `emptyTurn` to
+  `0` for counts files written before this version, so existing persisted state
+  loads cleanly rather than producing a `undefined` in the status line.
+
+### Tests
+
+- 8 new checks (64 total, all passing): thinking-only with no marker nudges; marker
+  present still routes to the C2 path; visible text is not nudged; `aborted` is not
+  nudged; and the cap path asserts exactly two nudges, that the second is the firm
+  one, and that a third dead turn is audited as `capped`.
+
+### Related, out of scope
+
+The engine-side counterpart for one affected engine is a config flag that closes the
+thinking block and continues (off by default upstream). The client nudge here is the
+provider-agnostic net for engines you cannot patch — and, unlike the flag, it also
+covers the case where the same symptom arrives from a different server. See the
+README's "which server actually died" note: an agent transcript records a *model*
+name, and the same model name can be served by two different engines on two
+different hosts, so the transcript alone cannot identify the faulty box.
+
 ## [0.3.4] — 2026-10-25
 
 One blind spot closed: a **second leaked-markup grammar**. Models trained on

@@ -28,7 +28,10 @@ import * as path from "node:path";
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "tcr-handler-"));
 process.env.HOME = HOME;
 
-const mod = await import("/home/erpod/.pi/agent/extensions/toolcall-rescue.ts");
+// Resolved relative to this file so a public clone runs against the published
+// artifact. Kept as a dynamic import: the isolated HOME above must be in place
+// before the extension module evaluates (it reads its counts file at load).
+const mod = await import(new URL("./toolcall-rescue.ts", import.meta.url).href);
 
 const T = ["tool", "_call"].join("");
 const OPEN = "<" + T + ">";
@@ -203,7 +206,7 @@ function readCounts(): Record<string, unknown> | null {
   check("P: counter unchanged by silent paths", c4 !== null && (c4 as any).total === 3, c4);
 }
 
-check("P: VERSION stamp is 0.3.3", mod.VERSION === "0.3.3", mod.VERSION);
+check("P: VERSION stamp is 0.3.5", mod.VERSION === "0.3.5", mod.VERSION);
 
 console.log("\n" + pass + " passed, " + fail + " failed");
 console.log("(isolated HOME: " + HOME + ")");

@@ -18,7 +18,9 @@
  * lost-call class (tool-use finish, zero calls delivered -> silent
  * stop); the extension gained analyzeLostCall() for it.
  */
-import { extractTailCalls, recoverInnermost, isEnabled, analyzeLostCall, hasMarkerEvidence, emptyCounts, bumpCounts, topPairs } from "/home/erpod/.pi/agent/extensions/toolcall-rescue.ts";
+// Imported from this repository's own copy so a public clone tests the published
+// artifact, not an untracked local install path.
+import { extractTailCalls, recoverInnermost, isEnabled, analyzeLostCall, hasMarkerEvidence, emptyCounts, bumpCounts, topPairs } from "./toolcall-rescue.ts";
 
 const T = ["tool", "_call"].join("");
 const OPEN = "<" + T + ">";

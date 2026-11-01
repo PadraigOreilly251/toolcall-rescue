@@ -51,6 +51,22 @@ the model's last act, inside thinking. Distinct from class 2: class 2 lies
 via a tool-use finish with zero calls; class 3 is a clean stop with the
 call hidden in the reasoning.
 
+### Class 4 — the marker-free empty turn (v0.3.5)
+
+Nothing leaked, nothing was dropped, and the stop reason is truthful: the model
+simply **ended the turn inside its reasoning**, producing a thinking-only message
+with zero visible text. There is no marker and no tool-use flag to detect, so every
+content-based rule in the pipeline sees a legitimate empty stop.
+
+Class 3 hides a *complete call* inside thinking and is rescuable. Class 4 hides
+*nothing* — and is the nastier neighbour, because the failure signal is absent by
+construction. The observed trigger is self-referential: the model quotes a literal
+end-of-turn control token while reasoning about that token, the tokenizer maps the
+quote to the real control id, and the engine stops on the quote.
+
+It is also the class most likely to be **blamed on the wrong machine**: see
+"which server actually died" under Limitations.
+
 ### Why it's a trap to fix
 
 The pattern itself is toxic to the pipeline. Writing a detector for it
@@ -68,8 +84,8 @@ replacements reach the loop). It is **deterministic** — pure regex, no LLM
 calls, microseconds per message — and engine-agnostic in structure (the tag
 names are constants at the top; add another format, get the same net).
 
-Three branches (plus the v0.3.2/v0.3.3 hardenings of the first two and
-the v0.3.4 second grammar):
+Four branches (plus the v0.3.2/v0.3.3 hardenings of the first two, the v0.3.4
+second grammar, and the v0.3.5 marker-free dead turn):
 
 1. **Rescue (class 1, complete tail).** If the message ends with one or more
    complete tool-call blocks (adjacent blocks = parallel calls), the leaked
@@ -115,6 +131,24 @@ the v0.3.4 second grammar):
    The stored stop reason is normalized to a clean stop (a tool-use message
    with no calls is malformed history) and the same words-only nudge asks for
    a real re-issue.
+4. **Empty-turn (class 4, v0.3.5) — the marker-free dead turn.** The model emits
+   **no markup at all** and the turn ends inside its own reasoning: a thinking-only
+   message, `stopReason: "stop"`, zero visible text. The workflow dies with nothing
+   to rescue, because there is nothing in the transcript that identifies it as a
+   failed call.
+   *Why the existing net missed it:* branch 3 needs `stopReason: "toolUse"` and the
+   v0.3.3 thinking-only path needs marker evidence. This turn has neither.
+   *Cause, in the wild:* the model **quotes** a literal end-of-turn control token
+   while reasoning about the token itself. The tokenizer maps the quote to the real
+   control id, the engine stops on it, and no character of the marker reaches the
+   text — so the marker that would have identified the failure is the thing that
+   caused it.
+   *Now:* a `continue` nudge, then a firm *do not end the turn inside thinking*
+   nudge, then silence plus a user notification pointing at the provider layer — a
+   persistent engine fault stays visible instead of looping. Counted as `emptyTurn`
+   (`E<n>` in `/rescue` status), audited `thinking-only-empty`. `"length"` and
+   `"aborted"` are deliberately not touched: a run that ends on `length` with empty
+   content is a different fault and is not papered over.
 
 Guardrails:
 
@@ -172,7 +206,7 @@ plain `node` on Node 23+):
 node toolcall-rescue.test.ts                    # 40 pure-function unit tests
 node --experimental-strip-types \
   toolcall-rescue.handler-test.ts               # 25 handler-level tests (pi mock, isolated HOME)
-node toolcall-rescue-tests/run.ts               # 56 v0.3.2-v0.3.4 regression checks
+node toolcall-rescue-tests/run.ts               # 64 v0.3.2-v0.3.5 regression checks
 ```
 
 The unit fixtures include the two captured field failures (complete-tail
@@ -181,8 +215,9 @@ truncated-tail guardrail, parallel blocks, and the lost-call class. The
 handler suite fires the real `message_end` handler through a pi mock and
 asserts each branch's observable effects (replacement content, nudge, audit
 entry, counter). The regression suite covers the v0.3.2 engine-invalid
-tool-name guard, the v0.3.3 thinking-only and length-cut classes, and the
-v0.3.4 Anthropic-style dialect, including the captured 2026-09 incident
+tool-name guard, the v0.3.3 thinking-only and length-cut classes, the
+v0.3.4 Anthropic-style dialect, and the v0.3.5 marker-free empty-turn class
+including the cap/escalation path, as well as the captured 2026-09 incident
 shapes (job.sh name poison; 47,002-char truncated tail) and the 2026-10-25
 thinking-only invoke dead turn.
 
@@ -310,6 +345,22 @@ exists upstream; this is the first (client-side, both classes, same-turn).
   (candidates: lazy parameter scanning that ends values at contiguous
   closing-tag strings; stochastic fragility). The net is deliberately
   mechanism-agnostic.
+- **The transcript cannot tell you which server died.** This is not a flaw in the
+  net, but it will mislead anyone debugging the classes it catches. An agent
+  transcript records a **model name**, not a host. Nothing stops two different
+  providers — two *different engines*, on two different machines — from exposing
+  the same model id, and an operator who switches providers between turns makes one
+  session span several engines. Diagnosing "the model dead-turned" from the
+  transcript alone will send you to the wrong box. Resolve the provider's base URL
+  to the port, and the port to the process bound at the time of the turn, before
+  believing any root-cause story. Corollary: an engine-side fix (a config flag on
+  one server) can be verified working and still leave the failing turns untouched,
+  because those turns were served elsewhere. **This net is the provider-agnostic
+  layer precisely so that the wrong-box problem cannot leave you unprotected.**
+- **Load-time caveat.** pi loads extensions once at process start. A session that
+  began on an older version runs the old behavior until restart, even after the new
+  file is installed. Check the `loaded v...` line (or `/rescue` status) against the
+  version you think is running.
 
 ## Provenance
 

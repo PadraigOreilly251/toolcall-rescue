@@ -1,8 +1,10 @@
 /**
- * toolcall-rescue v0.3.3 regression tests:
+ * toolcall-rescue v0.3.5 regression tests:
  *   - engine-invalid tool-name guard (v0.3.2)
  *   - thinking-only dead-turn materialization + malformed-thinking nudge (C2)
  *   - stopReason=length malformed-tail sanitize / closed-block rescue (C3)
+ *   - Anthropic <invoke> dialect in thinking (v0.3.4 C4)
+ *   - thinking-only no-marker dead turn: nudge + escalation + cap (v0.3.5 C5)
  *
  * Run:  node run.ts          (Node >= 23; on Node 22 use --experimental-strip-types)
  *
@@ -441,6 +443,78 @@ function msgWithText(text: string) {
     );
     check("C4 strix: no nudge on clean materialization", f10.sent.length === 0);
     check("C4 strix: audit rescue entry", f10.entries.some((e) => e.event === "rescue"));
+
+    // Case 11 (v0.3.5 C5): thinking-only, stop, NO marker evidence -
+    // the 2026-11-01 15:33Z Qwen/Strata incident (the model quoted a
+    // literal end-of-turn control token inside its reasoning; the engine
+    // stopped and the turn was empty). Pre-v0.3.5: silent no-op.
+    const deadThinking = {
+      role: "assistant",
+      content: [
+        {
+          type: "thinking",
+          thinking:
+            'The user is pushing back. Maybe there WAS a quality comparison - e.g. "does it emit ',
+        },
+      ],
+      stopReason: "stop",
+      provider: "vh114",
+      model: "qwen3.8-27b",
+    };
+    const f11 = makeFake();
+    const r11 = await f11.handler({ message: deadThinking }, { ui: undefined });
+    check("C5: thinking-only no-marker -> no message mutation", r11 === undefined);
+    check(
+      "C5: continue nudge sent",
+      f11.sent.length === 1 && f11.sent[0].includes("ended inside its thinking"),
+    );
+    check(
+      "C5: audit thinking-only-empty (not capped)",
+      f11.entries.some(
+        (e) => e.event === "thinking-only-empty" && e.capped === false && e.nudge === 1,
+      ),
+    );
+
+    // Case 12 (v0.3.5 C5): an aborted turn is not a dead turn - no nudge.
+    const f12 = makeFake();
+    const r12 = await f12.handler(
+      { message: { ...deadThinking, stopReason: "aborted" } },
+      { ui: undefined },
+    );
+    check(
+      "C5 aborted: no nudge, no audit",
+      r12 === undefined && f12.sent.length === 0 && f12.entries.length === 0,
+    );
+
+    // Case 13 (v0.3.5 C5): visible text with no marker stays a no-op;
+    // the text path owns the decision.
+    const f13 = makeFake();
+    const r13 = await f13.handler(
+      { message: msgWithText("plain prose, no markup") },
+      { ui: undefined },
+    );
+    check(
+      "C5 text-no-marker: no nudge (text path owns it)",
+      r13 === undefined && f13.sent.length === 0 && f13.entries.length === 0,
+    );
+
+    // Case 14 (v0.3.5 C5): the second dead turn escalates; the third is
+    // capped (exactly two nudges) and audited as capped.
+    const f14 = makeFake();
+    await f14.handler({ message: deadThinking }, { ui: undefined });
+    await f14.handler({ message: deadThinking }, { ui: undefined });
+    await f14.handler({ message: deadThinking }, { ui: undefined });
+    check("C5 cap: exactly 2 nudges", f14.sent.length === 2);
+    check(
+      "C5 cap: second nudge is the firm one",
+      f14.sent[1].includes("Do not end the turn inside thinking"),
+    );
+    check(
+      "C5 cap: third dead turn audited capped",
+      f14.entries.some(
+        (e) => e.event === "thinking-only-empty" && e.capped === true,
+      ),
+    );
   } finally {
     if (countsBackup !== null) fs.writeFileSync(COUNTS_FILE, countsBackup);
   }
