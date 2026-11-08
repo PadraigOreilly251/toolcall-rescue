@@ -132,6 +132,50 @@ check(
   hasMarkerEvidence(IOPEN + 'bash">' + PNAME_OPEN + 'command">x' + PCLOSE),
 );
 
+// ── v0.3.6 (C6): closed-pair rule ────────────────────────────────────
+// A tail that CLOSES its own anchor is complete content, not a truncation.
+// Incident (2026-11-08): a report that DOCUMENTED the Hermes wire
+// format had its last 5346 chars deleted, because a well-formed JSON-bodied
+// example does not match the <function=…> grammar, and the close tag was
+// read as evidence of a leak rather than of completeness.
+
+/** Hermes-style JSON-bodied call (NOT the <function=…> grammar). */
+function jsonCall(name: string, args: string): string {
+  return OPEN + '{"name": "' + name + '", "arguments": ' + args + '}' + CLOSE;
+}
+
+// The exact incident shape: inline-code example, then the report continues.
+const cited = extractTailCalls(
+  "Hermes, for example: `" + jsonCall("web_search", '{"query": "x"}') + "` — the arguments " +
+    "field is where you nest the actual payload, and the closing tag ends it.",
+);
+check("C6: cited closed example NOT sanitized", cited.calls.length === 0 && cited.malformedTail === false);
+
+// A closed pair that ends the reply is still complete - not a cut.
+const citedEnd = extractTailCalls("the format is `" + jsonCall("bash", '{"command": "ls"}') + "`");
+check("C6: closed example at end of reply NOT sanitized", citedEnd.malformedTail === false);
+
+// Bare closed pair, no fencing, prose after.
+const bareClosed = extractTailCalls(jsonCall("read", '{"path": "/tmp/x"}') + " and then more prose.");
+check("C6: bare closed pair + prose NOT sanitized", bareClosed.malformedTail === false);
+
+// THE OTHER SIDE: a real leak with no close tag is still a truncation.
+const unclosed = extractTailCalls("Sure! " + OPEN + "\n" + FOPEN + "bash>\n" + POPEN + "comma");
+check("C6: unclosed leak still sanitized", unclosed.malformedTail === true);
+
+// A closed example followed LATER by an unclosed leak: the tail bounds on the
+// LAST open, which is unclosed, so it must still sanitize.
+const mixed = extractTailCalls(
+  "example: " + jsonCall("bash", '{"command": "ls"}') + " then the real one: " + OPEN + FOPEN + "read>",
+);
+check("C6: closed example then unclosed leak still sanitizes", mixed.malformedTail === true);
+
+// Anthropic dialect gets the same rule via its own close tag.
+const invClosedJsonish = extractTailCalls(
+  "docs say " + IOPEN + 'bash">' + '{"command": "ls"}' + ICLOSE + " and that is all",
+);
+check("C6: closed <invoke> pair NOT sanitized", invClosedJsonish.malformedTail === false);
+
 // ── handler-level (stubbed pi; counts file backed up + restored) ─────
 const COUNTS_FILE = path.join(os.homedir(), ".pi", "agent", "data", "toolcall-rescue-counts.json");
 const countsBackup = fs.existsSync(COUNTS_FILE) ? fs.readFileSync(COUNTS_FILE) : null;

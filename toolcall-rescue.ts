@@ -129,6 +129,23 @@
  *       bug). Counted as emptyTurn; audited with reason
  *       "thinking-only-empty". stopReason "length"/"aborted" untouched.
  *
+ * v0.3.6 (2026-11-08): (C6) CLOSED-PAIR RULE - the extension was eating
+ *       legitimate answers. 2026-11-08, reported twice: a technical report that
+ *       DOCUMENTED the tool-call wire format had its final 5346 chars
+ *       deleted and got a nudge claiming its reply "ended with a tool
+ *       call". Cause: the malformed-tail test treated the PRESENCE of a
+ *       close tag as evidence of leaked markup. A quoted JSON-bodied
+ *       Hermes example does not match the `<function=…>` grammar, so it
+ *       fell to the partial-tail branch and everything from the last open
+ *       tag to end-of-reply was cut - the example plus all the prose
+ *       after it. Truncation is the ABSENCE of a close tag, not the
+ *       presence of one. A tail that closes its own anchor is complete
+ *       content and is now left alone; unclosed tails still sanitize, and
+ *       the bound is still the LAST open tag, so a closed example followed
+ *       by a real unclosed leak still sanitizes. Applied to both dialects
+ *       via a new `close` field. Net effect: rescue keeps its reach, loses
+ *       the false positives that destroyed real work.
+ *
  * Audit: every intervention -> stderr line "[toolcall-rescue] ..."
  * PLUS a persistent session entry (pi.appendEntry, customType
  * "toolcall-rescue"). The transcript itself is mutated in place by
@@ -140,7 +157,7 @@
  * hot-reload or a pi-upgrade drift is visible (host-fragility watch item).
  */
 
-export const VERSION = "0.3.5";
+export const VERSION = "0.3.6";
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -282,12 +299,19 @@ interface MarkupDialect {
   paramRe: RegExp;
   /** Optional wrapper close allowed after the block run. */
   suffix?: string;
+  /**
+   * The tag that CLOSES `anchor`. A tail containing it is complete and is
+   * never a truncation, however little it matches `blockRe` - see the
+   * closed-pair rule in `analyzeDialect`.
+   */
+  close: string;
 }
 
 const QWEN_DIALECT: MarkupDialect = {
   anchor: OPEN,
   blockRe: BLOCK_RE,
   paramRe: PARAM_RE,
+  close: CLOSE,
 };
 
 const ANTHROPIC_DIALECT: MarkupDialect = {
@@ -295,6 +319,7 @@ const ANTHROPIC_DIALECT: MarkupDialect = {
   blockRe: INVOKE_BLOCK_RE,
   paramRe: INVOKE_PARAM_RE,
   suffix: FUNCTION_CALLS_CLOSE,
+  close: INVOKE_CLOSE,
 };
 
 /** End offset of the meaningful tail (whitespace and optional wrapper close). */
@@ -362,6 +387,22 @@ function analyzeDialect(text: string, d: MarkupDialect): RescueAnalysis {
 
   // No complete block at the last marker: partial tail.
   const region = text.slice(lastOpenIdx);
+
+  // Closed-pair rule (v0.3.6). A tail that closes its own anchor is COMPLETE
+  // content, not a truncation - it just isn't a shape `blockRe` was written
+  // to materialize. The common case is prose *about* the wire format: an
+  // answer discussing Hermes/Qwen markup quotes a well-formed example, which
+  // does not match the `<function=…>` grammar, and the old code read the
+  // close tag as evidence of markup and cut from the open tag to the end.
+  // The 2026-11-08 incident deleted the final 5346 chars of a technical
+  // report and then nudged the model to "re-issue" a call that never was.
+  //
+  // Truncation is the ABSENCE of a close tag, not the presence of one. A
+  // genuinely cut leak (no close) still falls through and is sanitized.
+  if (region.includes(d.close)) {
+    return { calls: [], malformedTail: false, cutIndex: null };
+  }
+
   const markupish =
     region.trim() === "" ||
     region.includes("<" + "parameter") ||

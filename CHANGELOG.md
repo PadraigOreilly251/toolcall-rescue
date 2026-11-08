@@ -10,6 +10,42 @@ Hygiene note (as with every file in this repo): no contiguous instance of
 the detection marker appears below; "tool-call markup", "opening envelope",
 and "close" refer to the Qwen3-Coder-family XML tags.
 
+## [0.3.6] — 2026-11-08
+
+The rescue itself was eating legitimate answers. This is the first release where the
+extension, not the model, was the cause of lost content.
+
+### Fixed
+
+- **(C6) Closed-pair rule.** A tail that closes its own opening envelope is
+  **complete content**, not a truncation. The malformed-tail test had been treating
+  the *presence* of a close tag as evidence of leaked markup. A quoted, well-formed
+  JSON-bodied Hermes example does not match the `<function=…>` grammar, so it fell
+  to the partial-tail branch, and everything from the last opening envelope to
+  end-of-reply was cut — the example **plus all the prose that followed it**.
+  - Observed twice on 2026-11-08. A technical report that *documented* the
+    tool-call wire format lost its final 5,346 characters and received a nudge
+    asserting its reply "ended with a tool call" — a claim that was false, and
+    which the model correctly pushed back on before repeating itself into the same
+    cut.
+  - The rule now: **truncation is the absence of a close tag, not the presence of
+    one.** The bound stays the *last* opening envelope, so a closed example followed
+    by a genuine unclosed leak still sanitizes.
+  - Applied to both dialects through a new required `close` field on the dialect
+    record, rather than by special-casing one grammar.
+  - Net effect: rescue keeps its full reach over real leaks and loses the false
+    positives that destroyed real work.
+
+### Tests
+
+- 6 new C6 checks (64 → 70), covering: cited closed example, closed example at
+  end of reply, bare closed pair with trailing prose, unclosed leak still caught,
+  closed example followed by unclosed leak still caught, and the same rule for the
+  Anthropic-style dialect.
+- Red→green proven by removing the rule and observing exactly the 3 false-positive
+  checks fail while the 3 true-positive checks stay green — i.e. the new tests
+  discriminate the change rather than merely passing under it.
+
 ## [0.3.5] — 2026-11-01
 
 A third death class, one notch removed from leaked markup: the model never emits
